@@ -41,7 +41,7 @@ env:
 
 jobs:
   prepare-matrix:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       ubuntu_matrix: ${{ steps.set-matrix.outputs.ubuntu_matrix }}
     steps:
@@ -64,7 +64,7 @@ jobs:
           echo "Matrix: $ubuntu_matrix"
 
   build-ubuntu:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: prepare-matrix
     strategy:
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.ubuntu_matrix) }}
@@ -197,7 +197,7 @@ jobs:
 
   create-release:
     needs: [prepare-matrix, build-ubuntu]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     if: always() && needs.build-ubuntu.result == 'success' && (github.event_name != 'workflow_dispatch' || github.event.inputs.create_release != 'false')
     permissions:
       contents: write
