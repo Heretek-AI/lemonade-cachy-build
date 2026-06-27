@@ -1,0 +1,255 @@
+name: Build CachyLLama + ROCm
+
+on:
+  workflow_dispatch:
+    inputs:
+      gfx_target:
+        description: 'AMD GPU targets (comma-separated)'
+        required: false
+        default: 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X,gfx90a,gfx908'
+      backend:
+        description: 'Backend: rocm, vulkan, or both'
+        required: false
+        default: 'both'
+      cachyllama_ref:
+        description: 'CachyLLama ref (tag/branch/commit) or "main"'
+        required: false
+        default: 'main'
+      rocm_version:
+        description: 'TheRock ROCm version or "latest"'
+        required: false
+        default: 'latest'
+      create_release:
+        description: 'Create a GitHub release after successful build'
+        required: false
+        default: true
+        type: boolean
+
+  schedule:
+    # ~07:17 UTC, off-peak.
+    - cron: '17 7 * * *'
+
+  push:
+    tags:
+      - 'v*'
+
+env:
+  GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X,gfx90a,gfx908' }}
+  BACKEND: ${{ github.event.inputs.backend || 'both' }}
+  CACHYLLAMA_REF: ${{ github.event.inputs.cachyllama_ref || 'main' }}
+  ROCM_VERSION: ${{ github.event.inputs.rocm_version || 'latest' }}
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-22.04
+    outputs:
+      ubuntu_matrix: ${{ steps.set-matrix.outputs.ubuntu_matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          targets="${{ env.GFX_TARGETS }}"
+          backend="${{ env.BACKEND }}"
+          # gfx90a / gfx908 are CDNA — ROCm only, skip Vulkan.
+          cdna="gfx90a gfx908"
+          rows='[]'
+          for gfx in $(echo "$targets" | tr ',' ' '); do
+            for b in rocm vulkan; do
+              if [ "$backend" != "both" ] && [ "$backend" != "$b" ]; then continue; fi
+              if echo "$cdna" | grep -qw "$gfx" && [ "$b" = "vulkan" ]; then continue; fi
+              rows=$(echo "$rows" | jq -c --arg g "$gfx" --arg b "$b" '. + [{gfx_target:$g, backend:$b}]')
+            done
+          done
+          ubuntu_matrix=$(echo "$rows" | jq -c '{include: .}')
+          echo "ubuntu_matrix=$ubuntu_matrix" >> "$GITHUB_OUTPUT"
+          echo "Matrix: $ubuntu_matrix"
+
+  build-ubuntu:
+    runs-on: ubuntu-22.04
+    needs: prepare-matrix
+    strategy:
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.ubuntu_matrix) }}
+      fail-fast: false
+    outputs:
+      rocm_version: ${{ steps.set-outputs.outputs.rocm_version }}
+      cachyllama_commit: ${{ steps.set-outputs.outputs.cachyllama_commit }}
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: curl -fsSL https://raw.githubusercontent.com/kou/arrow/e49d8ae15583ceff03237571569099a6ad62be32/ci/scripts/util_free_space.sh | bash
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build unzip curl zstd patchelf jq libvulkan-dev
+
+      - name: Download TheRock ROCm SDK (ROCm backend only)
+        if: matrix.backend == 'rocm'
+        run: |
+          rocm_version="${{ env.ROCM_VERSION }}"
+          gfx="${{ matrix.gfx_target }}"
+          s3_target="$gfx"
+          case "$gfx" in
+            gfx103X|gfx110X|gfx120X) s3_target="${gfx}-all" ;;
+          esac
+          base_url="https://rocm.nightlies.amd.com/tarball-multi-arch"
+          if [ "$rocm_version" = "latest" ]; then
+            prefix="therock-dist-linux-${s3_target}-"
+            files_json=$(curl -s "$base_url/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)')
+            latest_file=$(echo "$files_json" | jq -r --arg p "$prefix" \
+              '[.[] | select(.name | startswith($p)) | select(.name | test("[0-9]{8}\\.tar\\.gz$"))] | sort_by(.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) | last | .name // empty')
+            [ -n "$latest_file" ] || { echo "No tarball for $prefix"; exit 1; }
+            rocm_version=$(echo "$latest_file" | grep -oP 'therock-dist-linux-'"$s3_target"'-\K[0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+')
+            rocm_url="$base_url/$latest_file"
+          else
+            rocm_url="$base_url/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
+          fi
+          echo "DETECTED_ROCM_VERSION=$rocm_version" >> "$GITHUB_ENV"
+          sudo mkdir -p /opt/rocm
+          curl -sL "$rocm_url" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
+
+      - name: Set ROCm env (ROCm backend only)
+        if: matrix.backend == 'rocm'
+        run: |
+          echo "HIP_PATH=/opt/rocm" >> "$GITHUB_ENV"
+          echo "ROCM_PATH=/opt/rocm" >> "$GITHUB_ENV"
+          echo "HIP_CLANG_PATH=/opt/rocm/llvm/bin" >> "$GITHUB_ENV"
+          echo "/opt/rocm/bin:/opt/rocm/llvm/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib" >> "$GITHUB_ENV"
+
+      - name: Clone CachyLLama
+        run: |
+          ref="${{ env.CACHYLLAMA_REF }}"
+          git clone --depth 1 https://github.com/fewtarius/CachyLLama.git llama.cpp
+          cd llama.cpp
+          # Fetch the specific ref (works for commit SHA, tag, or branch) and check it out.
+          git fetch --depth 1 origin "$ref"
+          git checkout "$ref"
+          echo "CACHYLLAMA_COMMIT=$(git rev-parse --short=5 HEAD)" >> "$GITHUB_ENV"
+          git log --oneline -1
+
+      - name: Build (ROCm)
+        if: matrix.backend == 'rocm'
+        env:
+          GFX_TARGET: ${{ matrix.gfx_target }}
+          ROCM_PATH: /opt/rocm
+          LLAMA_DIR: ./llama.cpp
+        run: ./scripts/build-rocm.sh
+
+      - name: Build (Vulkan)
+        if: matrix.backend == 'vulkan'
+        env:
+          LLAMA_DIR: ./llama.cpp
+        run: ./scripts/build-vulkan.sh
+
+      - name: Bundle ROCm libs
+        if: matrix.backend == 'rocm'
+        env:
+          ROCM_PATH: /opt/rocm
+          BUILD_BIN: ./llama.cpp/build/bin
+        run: ./scripts/bundle-rocm-libs.sh
+
+      - name: Smoke check — binary runs + links
+        if: always()
+        run: |
+          cd llama.cpp/build/bin
+          if [ -x llama-server ]; then
+            ./llama-server --version
+            if ldd llama-server 2>&1 | grep -q "not found"; then
+              echo "ldd reports missing libs"; exit 1
+            fi
+          else
+            echo "llama-server not found"; exit 1
+          fi
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            echo "tag=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=nightly-pending" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Make archive
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          BACKEND: ${{ matrix.backend }}
+          GFX_TARGET: ${{ matrix.gfx_target }}
+          BUILD_BIN: ./llama.cpp/build/bin
+        run: ./scripts/make-archive.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cachy-ubuntu-${{ matrix.backend }}-${{ matrix.gfx_target }}-x64
+          path: cachy-*-ubuntu-${{ matrix.backend }}-${{ matrix.gfx_target }}-x64.tar.zst
+          retention-days: 30
+
+      - id: set-outputs
+        if: always()
+        run: |
+          echo "rocm_version=${DETECTED_ROCM_VERSION:-none}" >> "$GITHUB_OUTPUT"
+          echo "cachyllama_commit=${CACHYLLAMA_COMMIT:-none}" >> "$GITHUB_OUTPUT"
+
+  create-release:
+    needs: [prepare-matrix, build-ubuntu]
+    runs-on: ubuntu-22.04
+    if: always() && needs.build-ubuntu.result == 'success' && (github.event_name != 'workflow_dispatch' || github.event.inputs.create_release != 'false')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./all-artifacts
+
+      - name: Resolve release tag
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG="${GITHUB_REF##*/}"
+          else
+            existing=$(gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep -E '^b[0-9]{4}$' | sort -V || true)
+            if [ -z "$existing" ]; then n=1000; else n=$(( $(echo "$existing" | tail -n1 | sed 's/^b//') + 1 )); fi
+            TAG=$(printf "b%04d" "$n")
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$([ "${GITHUB_REF_TYPE:-}" = "tag" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+
+      - name: Rename artifacts with tag
+        run: |
+          TAG="${{ steps.rel.outputs.tag }}"
+          mkdir -p out
+          for d in all-artifacts/cachy-ubuntu-*; do
+            [ -d "$d" ] || continue
+            base=$(basename "$d")              # cachy-ubuntu-rocm-gfx1151-x64
+            backend=$(echo "$base" | cut -d- -f3)
+            gfx=$(echo "$base" | cut -d- -f4)
+            mv "$d"/*.tar.zst "out/cachy-${TAG}-ubuntu-${backend}-${gfx}-x64.tar.zst"
+          done
+          ls -la out
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.rel.outputs.tag }}"
+          PRERELEASE="${{ steps.rel.outputs.prerelease }}"
+          args=()
+          [ "$PRERELEASE" = "true" ] && args+=(--prerelease)
+          [ "$PRERELEASE" = "false" ] && args+=(--latest)
+          gh release create "$TAG" out/*.tar.zst --title "$TAG" --notes "$(cat <<EOF
+          **Build**: $TAG
+          **gfx**: ${{ env.GFX_TARGETS }}
+          **Backend**: ${{ env.BACKEND }}
+          **ROCm**: ${{ needs.build-ubuntu.outputs.rocm_version }}
+          **CachyLLama**: ${{ needs.build-ubuntu.outputs.cachyllama_commit }}
+          **Built**: $(date -u '+%Y-%m-%d %H:%M UTC')
+          EOF
+          )" "${args[@]}"

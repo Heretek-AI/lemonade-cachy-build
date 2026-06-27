@@ -1,0 +1,54 @@
+name: Test released archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to test (e.g. b1042 or v1.0.0)'
+        required: true
+      gfx_target:
+        description: 'gfx target'
+        required: true
+        default: 'gfx1151'
+      backend:
+        description: 'rocm or vulkan'
+        required: true
+        default: 'rocm'
+  workflow_run:
+    workflows: ["Build CachyLLama + ROCm"]
+    types: [completed]
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: t
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "tag=${{ github.event.workflow_run.head_branch }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.t.outputs.tag }}"
+          GFX="${{ github.event.inputs.gfx_target || 'gfx1151' }}"
+          BACKEND="${{ github.event.inputs.backend || 'rocm' }}"
+          asset="cachy-${TAG}-ubuntu-${BACKEND}-${GFX}-x64.tar.zst"
+          gh release download "$TAG" --pattern "$asset" --output "$asset"
+          mkdir -p extract && tar --use-compress-program=zstd -xf "$asset" -C extract
+
+      - name: Run llama-server --version
+        run: |
+          cd extract
+          chmod +x llama-server
+          ./llama-server --version
+          if ldd llama-server 2>&1 | grep -q "not found"; then
+            echo "ldd reports missing libs"; exit 1
+          fi

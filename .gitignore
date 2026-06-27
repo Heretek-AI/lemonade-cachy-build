@@ -1,0 +1,20 @@
+# CachyLLama source clone (shallow, created by build scripts)
+llama.cpp/
+CachyLLama/
+
+# Build output
+build/
+bin/
+
+# Archives
+*.tar.zst
+*.tar.gz
+*.zip
+
+# Local ROCm SDK scratch
+rocm/
+opt-rocm/
+
+# OS / editor
+.DS_Store
+*.swp
