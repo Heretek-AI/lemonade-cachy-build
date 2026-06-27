@@ -194,7 +194,7 @@ jobs:
   create-release:
     needs: [prepare-matrix, build-ubuntu]
     runs-on: ubuntu-22.04
-    if: always() && needs.build-ubuntu.result == 'success'
+    if: always() && needs.build-ubuntu.result == 'success' && (github.event_name != 'workflow_dispatch' || github.event.inputs.create_release != 'false')
     permissions:
       contents: write
     steps:
