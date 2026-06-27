@@ -82,7 +82,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build unzip curl zstd patchelf jq
+          sudo apt-get install -y cmake ninja-build unzip curl zstd patchelf jq libvulkan-dev
 
       - name: Download TheRock ROCm SDK (ROCm backend only)
         if: matrix.backend == 'rocm'
@@ -121,9 +121,11 @@ jobs:
       - name: Clone CachyLLama
         run: |
           ref="${{ env.CACHYLLAMA_REF }}"
-          git clone --depth 1 --single-branch --branch "$ref" https://github.com/fewtarius/CachyLLama.git llama.cpp 2>/dev/null \
-            || git clone --depth 1 https://github.com/fewtarius/CachyLLama.git llama.cpp
+          git clone --depth 1 https://github.com/fewtarius/CachyLLama.git llama.cpp
           cd llama.cpp
+          # Fetch the specific ref (works for commit SHA, tag, or branch) and check it out.
+          git fetch --depth 1 origin "$ref"
+          git checkout "$ref"
           echo "CACHYLLAMA_COMMIT=$(git rev-parse --short=5 HEAD)" >> "$GITHUB_ENV"
           git log --oneline -1
 
