@@ -12,9 +12,9 @@ on:
         required: false
         default: 'both'
       cachyllama_ref:
-        description: 'CachyLLama ref (tag/branch/commit) or "main"'
+        description: 'CachyLLama ref (tag/branch/commit) or "master"'
         required: false
-        default: 'main'
+        default: 'master'
       rocm_version:
         description: 'TheRock ROCm version or "latest"'
         required: false
@@ -36,7 +36,7 @@ on:
 env:
   GFX_TARGETS: ${{ github.event.inputs.gfx_target || 'gfx1151,gfx1150,gfx120X,gfx110X,gfx103X,gfx90a,gfx908' }}
   BACKEND: ${{ github.event.inputs.backend || 'both' }}
-  CACHYLLAMA_REF: ${{ github.event.inputs.cachyllama_ref || 'main' }}
+  CACHYLLAMA_REF: ${{ github.event.inputs.cachyllama_ref || 'master' }}
   ROCM_VERSION: ${{ github.event.inputs.rocm_version || 'latest' }}
 
 jobs:
@@ -98,7 +98,7 @@ jobs:
             prefix="therock-dist-linux-${s3_target}-"
             files_json=$(curl -s "$base_url/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)')
             latest_file=$(echo "$files_json" | jq -r --arg p "$prefix" \
-              '[.[] | select(.name | startswith($p)) | select(.name | test("[0-9]{8}\\.tar\\.gz$"))] | sort_by(.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) | last | .name // empty')
+              '[.[] | select(.name | startswith($p)) | select(.name | test("[0-9]{8}\\.tar\\.gz$")) | select(.name | test("-tests-") | not)] | sort_by(.name | capture("(?<d>[0-9]{8})\\.tar\\.gz$").d) | last | .name // empty')
             [ -n "$latest_file" ] || { echo "No tarball for $prefix"; exit 1; }
             rocm_version=$(echo "$latest_file" | grep -oP 'therock-dist-linux-'"$s3_target"'-\K[0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+')
             rocm_url="$base_url/$latest_file"
@@ -121,11 +121,13 @@ jobs:
       - name: Clone CachyLLama
         run: |
           ref="${{ env.CACHYLLAMA_REF }}"
-          git clone --depth 1 https://github.com/fewtarius/CachyLLama.git llama.cpp
+          git clone --no-checkout --filter=tree:0 https://github.com/fewtarius/CachyLLama.git llama.cpp
           cd llama.cpp
-          # Fetch the specific ref (works for commit SHA, tag, or branch) and check it out.
+          # Resolve ref to a commit. Works for SHA, tag, or branch.
+          # `git fetch --depth 1 origin <ref>` works for tags/branches; for a raw
+          # SHA on github.com it also succeeds (GitHub serves SHAs directly).
           git fetch --depth 1 origin "$ref"
-          git checkout "$ref"
+          git checkout FETCH_HEAD
           echo "CACHYLLAMA_COMMIT=$(git rev-parse --short=5 HEAD)" >> "$GITHUB_ENV"
           git log --oneline -1
 
